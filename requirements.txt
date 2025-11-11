@@ -1,0 +1,40 @@
+# --- Core numeric / utils ---
+numpy==1.26.4
+pandas==2.2.2
+PyYAML==6.0.2
+tqdm==4.66.4
+requests==2.31.0
+
+# --- PyTorch stack (portable; CPU wheels by default) ---
+# If you need CUDA wheels, install with the PyTorch index URL for your CUDA after pip resolves this file.
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
+
+# --- Vision / augmentation ---
+albumentations==2.0.6
+opencv-python-headless==4.11.0.86
+scikit-image==0.24.0
+pillow==10.2.0
+einops==0.8.0
+timm==1.0.3
+segmentation_models_pytorch==0.5.0
+ttach==0.0.3
+
+# --- Hugging Face (for transformers-based models) ---
+transformers==4.57.1
+huggingface-hub==0.36.0
+tokenizers==0.22.1
+safetensors==0.4.3
+
+# --- ONNX / runtime (edge-proxy CPU path) ---
+onnx==1.19.1
+onnxruntime==1.23.2
+
+# --- Optional helpers (metrics, logging, cfg) ---
+torchmetrics==0.10.3
+omegaconf==2.3.0
+fvcore==0.1.5.post20221221
+iopath==0.1.10
+yacs==0.1.8
+tabulate==0.9.0
