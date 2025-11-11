@@ -243,7 +243,7 @@ If you find this work or the EIDSeg dataset useful in your research, please cons
 @article{huang2025eidseg,
   title   = {EIDSeg: Post-Earthquake Infrastructure Damage Segmentation Dataset},
   author  = {Huili Huang and Chengeng Liu and Danrong Zhang and Shail Patel and Anastasiya Masalava and Sagar Sadak and Parisa Babolhavaeji and Weihong Low and Max Mahdi Roozbahani and J.~David Frost},
-  journal = {arXiv preprint arXiv:XXXXX},
+  journal = {arXiv preprint arXiv:https://arxiv.org/abs/2511.06456},
   year    = {2025}
 }
 ```
