@@ -235,10 +235,6 @@ Please ⭐ if you find it useful so that I find the motivation to keep improving
 
 
 
-Here’s a clean, professional paragraph you can use in your README:
-
-
-
 ## Citation
 
 If you find this work or the EIDSeg dataset useful in your research, please consider citing our paper. Your citation helps support and encourage future development of this project.
