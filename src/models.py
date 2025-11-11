@@ -12,7 +12,7 @@ from transformers import (
     SegformerImageProcessor, SegformerForSemanticSegmentation,
     Mask2FormerImageProcessor, Mask2FormerForUniversalSegmentation,
     OneFormerProcessor, OneFormerForUniversalSegmentation,
-    EomtForUniversalSegmentation
+    #EomtForUniversalSegmentation
 )
 
 # ----------------------------- DeepLabV3+ support -----------------------------

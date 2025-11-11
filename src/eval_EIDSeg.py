@@ -1,147 +1,283 @@
+
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
 Evaluate fine-tuned segmentation models on the EIDSeg dataset.
-
-- Supports HF models (Mask2Former / OneFormer / SegFormer / BEiT / EoMT)
-- Supports external DeepLabV3+ repo model (VainF/DeepLabV3Plus-Pytorch)
-- Outputs: mIoU (foreground only), pixAcc (foreground only), FWIoU (foreground only),
-  per-class IoU/F1, FLOPs, Params, and a Confusion Matrix PDF (+ CSVs).
-
-Assumptions:
-- You have: datasets.py (UniversalSegmentationDataset, DeepLabV3PlusDataset)
-- You have: models.py (load_model_and_processor, process_outputs_for_semantic)
+Outputs mIoU, pixel accuracy, FWIoU, per-class IoU/F1, FLOPs and parameter count.
+Excludes void class from mIoU, pixAcc, and FWIoU calculations.
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-import numpy as np
-import torch
-from torch.utils.data import DataLoader
-from PIL import Image  # noqa: F401  (kept for PIL.Image compatibility in datasets)
-from tqdm.auto import tqdm
+import cv2                               # type: ignore
+import numpy as np                       # type: ignore
+import pandas as pd                      # type: ignore
+import torch                             # type: ignore
+from albumentations import Compose, Resize  # type: ignore
 from fvcore.nn import FlopCountAnalysis  # type: ignore
+from PIL import Image                    # type: ignore
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm               # notebook- & script-friendly
+from transformers import (
+    AutoImageProcessor,
+    AutoModelForSemanticSegmentation,
+    SegformerImageProcessor,
+    SegformerForSemanticSegmentation,
+    Mask2FormerImageProcessor,
+    Mask2FormerForUniversalSegmentation,
+    OneFormerProcessor,
+    OneFormerForUniversalSegmentation,
+    EomtForUniversalSegmentation,
+)
 
-# Local modules you shared
-from data import UniversalSegmentationDataset, DeepLabV3PlusDataset
-from models import load_model_and_processor, process_outputs_for_semantic
 
-# ---- Matplotlib headless for servers ----
 import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-
-import cv2  # type: ignore  # rasterize polygons (used inside datasets)
-
+matplotlib.use("Agg")  # headless
+import matplotlib.pyplot as plt
 
 # --------------------------------------------------------------------------------------
 # Globals
 # --------------------------------------------------------------------------------------
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"★ Using device: {DEVICE}")
-np.set_printoptions(suppress=True, linewidth=140)
+import os
+
+os.environ["USE_PYTORCH_KERNEL_CACHE"] = "0"
+# --------------------------------------------------------------------------------------
+# Dataset
+# --------------------------------------------------------------------------------------
+class UniversalSegmentationDataset_Plan5(torch.utils.data.Dataset):
+    """Dataset reader that turns CVAT XML polygon annotations into semantic masks."""
+
+    CLASS_MAP = {
+        "UD_Building": 0,
+        "D_Building" : 1,
+        "Debris"     : 2,
+        "UD_Road"    : 3,
+        "D_Road"     : 4,
+        "Undesignated": 5,
+        "Background" : 5,
+    }
+    CLASS_NAMES = [
+        "UD_Building", "D_Building", "Debris",
+        "UD_Road", "D_Road", "void",
+    ]
+    NUM_CLASSES: int = 6
+    FOREGROUND_CLASSES: int = 5  # Number of foreground classes (excluding void)
+
+    def __init__(
+        self,
+        annotation_xml: str | Path,
+        image_dir: str | Path,
+        image_processor,
+        image_size: Tuple[int, int] = (512, 512),
+        model_type: str = "mask2former",
+    ) -> None:
+        super().__init__()
+        self.image_dir = Path(image_dir)
+        self.image_processor = image_processor
+        self.size = image_size
+        self.model_type = model_type
+
+        # collect image files
+        self.filenames = sorted(
+            p for p in self.image_dir.glob("**/*")
+            if p.suffix.lower() in {".jpg", ".png"}
+        )
+        if not self.filenames:
+            raise FileNotFoundError(f"No images found in {self.image_dir}")
+
+        # parse XML once
+        self.polygons = self._parse_xml(annotation_xml)
+
+        # resize transform
+        self.transform = Compose([Resize(height=self.size[0], width=self.size[1])])
+
+    # ---------------- XML parsing ----------------
+    @staticmethod
+    def _parse_xml(xml_path: str | Path) -> Dict[str, List[Tuple[List[Tuple[float, float]], str]]]:
+        tree = ET.parse(str(xml_path))
+        root = tree.getroot()
+        poly_dict: Dict[str, List[Tuple[List[Tuple[float, float]], str]]] = {}
+        for img in root.findall(".//image"):
+            name = img.get("name")
+            if name is None:
+                continue
+            for poly in img.findall(".//polygon"):
+                label = poly.get("label") or "Background"
+                pts = [
+                    tuple(map(float, pt.split(",")))
+                    for pt in (poly.get("points") or "").split(";")
+                    if pt
+                ]
+                poly_dict.setdefault(name, []).append((pts, label))
+        return poly_dict
+
+    # -------------- rasterisation helpers --------------
+    @staticmethod
+    def _fill_poly(mask: np.ndarray, polygon, class_id: int):
+        pts = np.round(np.array(polygon)).astype(np.int32).reshape(-1, 1, 2)
+        if len(pts) >= 3:
+            cv2.fillPoly(mask, [pts], int(class_id))
+        return mask
+
+    def _make_mask(self, img_name: str, hw: Tuple[int, int]) -> np.ndarray:
+        mask = np.full(hw[::-1], self.CLASS_MAP["Background"], dtype=np.uint8)
+        for poly, lab in self.polygons.get(img_name, []):
+            cid = self.CLASS_MAP.get(lab)
+            if cid is not None:
+                mask = self._fill_poly(mask, poly, cid)
+        return mask
+
+    # -------------- dataloader hooks --------------
+    def __len__(self):  # noqa: D401
+        return len(self.filenames)
+
+    def __getitem__(self, idx: int):
+        img_path = self.filenames[idx]
+        img = Image.open(img_path).convert("RGB")
+        mask = self._make_mask(img_path.name, img.size)
+
+        aug = self.transform(image=np.asarray(img), mask=mask)
+        img_aug, mask_aug = Image.fromarray(aug["image"]), aug["mask"]
+
+        # OneFormer needs task_inputs = ["semantic"]
+        if self.model_type == "oneformer":
+            enc = self.image_processor(
+                images=[img_aug],
+                task_inputs=["semantic"],
+                return_tensors="pt",
+            )
+            task_inputs = enc["task_inputs"].squeeze(0)
+        else:
+            enc = self.image_processor(images=img_aug, return_tensors="pt")
+            task_inputs = None
+
+        pixel_values = enc["pixel_values"].squeeze(0)
+        mask_rs = cv2.resize(
+            mask_aug,
+            (pixel_values.shape[-1], pixel_values.shape[-2]),
+            interpolation=cv2.INTER_NEAREST,
+        )
+
+        sample = {
+            "pixel_values": pixel_values,
+            "pixel_mask": torch.from_numpy(mask_rs).long(),
+        }
+        if task_inputs is not None:
+            sample["task_inputs"] = task_inputs
+        return sample
 
 
 # --------------------------------------------------------------------------------------
-# Metrics
+# Metrics helpers
 # --------------------------------------------------------------------------------------
 def _fast_hist(pred: np.ndarray, gt: np.ndarray, K: int) -> np.ndarray:
     k = (gt >= 0) & (gt < K)
     return np.bincount(K * gt[k].astype(int) + pred[k].astype(int),
-                       minlength=K**2).reshape(K, K)
+                       minlength=K ** 2).reshape(K, K)
 
 
-def compute_metrics(
-    preds: List[np.ndarray],
-    gts: List[np.ndarray],
-    K: int,
-    foreground_K: int = 5
-):
-    """Return (mIoU_foreground, pixAcc_foreground, FWIoU_foreground, iou_all, f1_all, hist)."""
+def compute_metrics(preds, gts, K: int, foreground_K: int = 5):
     hist = np.zeros((K, K), dtype=np.float64)
     for p, g in zip(preds, gts):
         hist += _fast_hist(p.flatten(), g.flatten(), K)
 
-    # all-class IoU (includes void in last index)
+    # Compute IoU for all classes (including void)
     iou = np.diag(hist) / (hist.sum(1) + hist.sum(0) - np.diag(hist) + 1e-6)
+    
+    # Compute mIoU only for foreground classes (excluding void, index 5)
+    foreground_iou = iou[:foreground_K]
+    miou = foreground_iou.mean()
 
-    # mIoU foreground only
-    miou = iou[:foreground_K].mean()
+    # Compute pixel accuracy only for foreground classes
+    foreground_mask = np.isin(gts, range(foreground_K)).flatten()
+    correct = (np.array(preds).flatten()[foreground_mask] == np.array(gts).flatten()[foreground_mask]).sum()
+    total = foreground_mask.sum()
+    pixel_acc = correct / (total + 1e-6)
 
-    # pixel accuracy (foreground only)
-    pred_flat = np.concatenate([p.flatten() for p in preds])
-    gt_flat   = np.concatenate([g.flatten() for g in gts])
-    fg_mask   = (gt_flat >= 0) & (gt_flat < foreground_K)
-    pixel_acc = (pred_flat[fg_mask] == gt_flat[fg_mask]).mean()
-
-    # frequency-weighted IoU (foreground only)
+    # Compute FWIoU only for foreground classes
     freq = hist[:foreground_K].sum(1) / (hist[:foreground_K].sum() + 1e-6)
     fwiou = (freq[freq > 0] * iou[:foreground_K][freq > 0]).sum()
 
+    # Compute precision, recall, F1 for all classes
     precision = np.diag(hist) / (hist.sum(0) + 1e-6)
-    recall    = np.diag(hist) / (hist.sum(1) + 1e-6)
+    recall = np.diag(hist) / (hist.sum(1) + 1e-6)
     f1 = 2 * precision * recall / (precision + recall + 1e-6)
 
-    return float(miou), float(pixel_acc), float(fwiou), iou, f1, hist
+    return miou, pixel_acc, fwiou, iou, f1,hist
 
 
 # --------------------------------------------------------------------------------------
-# Viz helpers
+# Model utilities
 # --------------------------------------------------------------------------------------
-def plot_and_save_confmat(
-    hist: np.ndarray,
-    class_names: List[str],
-    out_pdf: Path,
-    normalize: bool = True,
-    exclude_last: bool = True,
-    fontsize: int = 12,
-):
-    cm = hist.copy()
-    labels = class_names[:]
-    if exclude_last:
-        cm = cm[:-1, :-1]
-        labels = labels[:-1]
+def resolution_for(model_name: str) -> Tuple[int, int]:
+    name = model_name.lower()
+    if "beit" in name:
+        return 640, 640
+    if "eomt" in name:
+        return 1024, 1024
+    return 512, 512
 
-    counts = cm
-    if normalize:
-        row_sums = counts.sum(axis=1, keepdims=True) + 1e-12
-        norm = counts / row_sums
+
+def load_model_and_processor(model_name: str, num_classes: int, image_size: Tuple[int, int]):
+    size_cfg = {"height": image_size[0], "width": image_size[1]}
+
+    if "segformer" in model_name.lower():
+        proc = SegformerImageProcessor.from_pretrained(model_name, size=size_cfg)
+        mdl = SegformerForSemanticSegmentation.from_pretrained(
+            model_name, num_labels=num_classes, ignore_mismatched_sizes=True
+        )
+        mdl_type = "segformer"
+
+    elif "oneformer" in model_name.lower():
+        proc = OneFormerProcessor.from_pretrained(model_name, size=size_cfg)
+        mdl = OneFormerForUniversalSegmentation.from_pretrained(model_name)
+        in_feat = mdl.model.transformer_module.decoder.class_embed.in_features
+        mdl.model.transformer_module.decoder.class_embed = torch.nn.Linear(in_feat, num_classes)
+        mdl.config.num_labels = num_classes
+        mdl_type = "oneformer"
+
+    elif "eomt" in model_name.lower():
+        proc = AutoImageProcessor.from_pretrained(
+            model_name,
+            crop_size=size_cfg,
+            size={"shortest_edge": image_size[0], "longest_edge": image_size[1]},
+        )
+        mdl = EomtForUniversalSegmentation.from_pretrained(
+            model_name, num_labels=num_classes, ignore_mismatched_sizes=True
+        )
+        mdl_type = "eomt"
+
+    elif "mask2former" in model_name.lower():
+        proc = Mask2FormerImageProcessor.from_pretrained(model_name, size=size_cfg)
+        mdl = Mask2FormerForUniversalSegmentation.from_pretrained(
+            model_name, ignore_mismatched_sizes=True
+        )
+        mdl.class_predictor = torch.nn.Linear(mdl.class_predictor.in_features, num_classes)
+        mdl_type = "mask2former"
+
+    elif "beit" in model_name.lower() or "deeplab" in model_name.lower():
+        proc = AutoImageProcessor.from_pretrained(model_name, size=size_cfg)
+        mdl = AutoModelForSemanticSegmentation.from_pretrained(
+            model_name, num_labels=num_classes, ignore_mismatched_sizes=True
+        )
+        mdl_type = "beit" if "beit" in model_name.lower() else "deeplab"
+
     else:
-        norm = counts
+        raise ValueError(f"Unknown model name: {model_name}")
 
-    fig, ax = plt.subplots(figsize=(1.1 * len(labels), 1.0 * len(labels)))
-    im = ax.imshow(counts, aspect="auto")  # color = counts
-
-    ax.set_xticks(np.arange(len(labels)), labels=labels, rotation=45, ha="right", fontsize=fontsize)
-    ax.set_yticks(np.arange(len(labels)), labels=labels, fontsize=fontsize)
-    ax.set_xlabel("Predicted", fontsize=fontsize + 1)
-    ax.set_ylabel("Ground Truth", fontsize=fontsize + 1)
-    ax.set_title("Confusion Matrix", fontsize=fontsize + 2)
-
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            val = norm[i, j]
-            cnt = int(counts[i, j])
-            txt = f"{val*100:.1f}%\n({cnt})" if normalize else f"{cnt}"
-            ax.text(j, i, txt, va="center", ha="center", fontsize=fontsize - 1)
-
-    fig.tight_layout()
-    out_pdf.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_pdf, bbox_inches="tight")
-    plt.close(fig)
-
-    base = out_pdf.with_suffix("")
-    np.savetxt(f"{base}_counts.csv", counts, fmt="%.0f", delimiter=",")
-    np.savetxt(f"{base}_rownorm.csv", norm,   fmt="%.6f", delimiter=",")
+    mdl.to(DEVICE).eval()
+    return mdl, proc, mdl_type
 
 
-# --------------------------------------------------------------------------------------
-# FLOPs / params
-# --------------------------------------------------------------------------------------
 def model_stats(model: torch.nn.Module, example: torch.Tensor):
     try:
         flops = FlopCountAnalysis(model, (example,)).total()
@@ -151,171 +287,182 @@ def model_stats(model: torch.nn.Module, example: torch.Tensor):
     return flops, params
 
 
+def safe_load_checkpoint(path: str | Path, model: torch.nn.Module):
+    state = torch.load(path, map_location="cpu")
+    if isinstance(state, dict) and "model_state_dict" in state:
+        state = state["model_state_dict"]
+    model.load_state_dict(state, strict=False)
+    print(f"✓ Loaded checkpoint from {path}")
+
+
 # --------------------------------------------------------------------------------------
-# Evaluation core
+# Evaluation loop
 # --------------------------------------------------------------------------------------
-CLASS_NAMES = ["UD_Building", "D_Building", "Debris", "UD_Road", "D_Road", "void"]
-NUM_CLASSES = 6
-FOREGROUND_K = 5
 
-
-def default_input_size(model_type: str, model_name: str) -> Tuple[int, int]:
-    ln = model_name.lower()
-    if "eomt" in ln:
-        return (1024, 1024)
-    if "beit" in ln:
-        return (640, 640)
-    # Keep 512x512 for others by default
-    return (512, 512)
-
-
-def safe_load_checkpoint_for_finetune(model: torch.nn.Module, ckpt_path: Path):
+def plot_and_save_confmat(
+    hist: np.ndarray,
+    class_names: List[str],
+    out_pdf: Path,
+    normalize: bool = True,
+    exclude_last: bool = True,
+    fontsize: int = 9,
+):
     """
-    Load a fine-tuned checkpoint with tolerant key handling.
+    Save a confusion matrix as a vector-quality PDF.
+    - hist: KxK counts (rows = GT, cols = Pred)
+    - class_names: names for all K classes (must match hist)
+    - exclude_last: drop the last class (void) from the report
+    - normalize: show row-normalized values as annotations; color map uses counts
     """
-    state = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
-    if isinstance(state, dict):
-        # Try common wrappers
-        for k in ["model_state_dict", "state_dict", "model_state", "net"]:
-            if k in state and isinstance(state[k], dict):
-                state = state[k]
-                break
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    print(f"✓ Loaded checkpoint: {ckpt_path} | missing={len(missing)} unexpected={len(unexpected)}")
+    cm = hist.copy()
+    labels = class_names[:]
 
+    if exclude_last:
+        cm = cm[:-1, :-1]
+        labels = labels[:-1]
 
-def make_loader_for_model(
-    model_type: str,
-    processor,
-    images_dir: Path,
+    # counts for color scaling, row-normalized for annotations (optional)
+    counts = cm
+    if normalize:
+        row_sums = counts.sum(axis=1, keepdims=True) + 1e-12
+        norm = counts / row_sums
+    else:
+        norm = counts
+
+    # figure
+    fig, ax = plt.subplots(figsize=(1.1*len(labels), 1.0*len(labels)))  # scales with classes
+    im = ax.imshow(counts, aspect="auto")  # default colormap keeps it simple
+
+    # ticks/labels
+    ax.set_xticks(np.arange(len(labels)), labels=labels, rotation=45, ha="right", fontsize=fontsize)
+    ax.set_yticks(np.arange(len(labels)), labels=labels, fontsize=fontsize)
+    ax.set_xlabel("Predicted", fontsize=fontsize+1)
+    ax.set_ylabel("Ground Truth", fontsize=fontsize+1)
+    ax.set_title("Confusion Matrix", fontsize=fontsize+2)
+
+    # cell annotations (normalized values, with counts in parentheses)
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            val = norm[i, j]
+            cnt = int(counts[i, j])
+            txt = f"{val*100:.1f}%\n({cnt})" if normalize else f"{cnt}"
+            ax.text(j, i, txt, va="center", ha="center", fontsize=fontsize-1)
+
+    fig.tight_layout()
+    out_pdf.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_pdf, bbox_inches="tight")  # PDF is vector—hi-res by nature
+    plt.close(fig)
+
+    # also save raw and normalized CSVs alongside
+    base = out_pdf.with_suffix("")
+    np.savetxt(f"{base}_counts.csv", counts, fmt="%.0f", delimiter=",")
+    np.savetxt(f"{base}_rownorm.csv", norm,   fmt="%.6f", delimiter=",")
+
+    
+def evaluate_models(
+    image_dir: Path,
     annotation_xml: Path,
-    image_size: Tuple[int, int],
-    batch_size: int,
-) -> DataLoader:
-    if model_type == "deeplabv3plus":
-        ds = DeepLabV3PlusDataset(
-            annotation_xml=str(annotation_xml),
-            data_dir=str(images_dir.parent),  # expects <data_dir>/default/<images>
-            image_size=image_size,
-            augment=False,
+    model_catalog: Dict[str, str],
+    finetuned_ckpts: Dict[str, str] | None = None,
+    batch_size: int = 1,
+):
+    rows: List[Dict[str, float | str | None]] = []
+
+    outer = tqdm(model_catalog.items(), desc="Evaluating", unit="model")
+    for hub_name, short_name in outer:
+        img_size = resolution_for(hub_name)
+        outer.set_postfix(model=short_name, size=f"{img_size[0]}×{img_size[1]}")
+
+        model, processor, model_type = load_model_and_processor(
+            hub_name, UniversalSegmentationDataset_Plan5.NUM_CLASSES, img_size
         )
-        return DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
-    # HF family:
-    ds = UniversalSegmentationDataset(
-        annotation_xml=str(annotation_xml),
-        data_dir=str(images_dir.parent),     # expects <data_dir>/default/<images>
-        image_processor=processor,
-        model_type=model_type,
-        image_size=image_size,
-        augment=False,
-    )
-    return DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+        ckpt = (finetuned_ckpts or {}).get(short_name)
+        if ckpt:
+            safe_load_checkpoint(ckpt, model)
 
+        dataset = UniversalSegmentationDataset_Plan5(
+            annotation_xml, image_dir, processor, img_size, model_type=model_type
+        )
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
-def evaluate_one_model(
-    hub_or_tag: str,
-    short_name: str,
-    images_dir: Path,
-    annotation_xml: Path,
-    finetuned_path: Path | None,
-    batch_size: int,
-    deeplab_backbone: str,
-    deeplab_os: int,
-) -> Dict[str, float | str | None]:
-    # Build model + processor
-    img_size = default_input_size("", hub_or_tag)
-    model, processor, model_type = load_model_and_processor(
-        model_name=hub_or_tag,
-        num_classes=NUM_CLASSES,
-        image_size=img_size,
-        deeplab_backbone=deeplab_backbone,
-        deeplab_os=deeplab_os,
-        deeplab_cityscapes_ckpt=None,  # not needed for evaluation here
-    )
-    model.to(DEVICE).eval()
-
-    # Load fine-tuned weights if provided
-    if finetuned_path is not None:
-        safe_load_checkpoint_for_finetune(model, finetuned_path)
-
-    # Dataloader
-    loader = make_loader_for_model(
-        model_type=model_type,
-        processor=processor,
-        images_dir=images_dir,
-        annotation_xml=annotation_xml,
-        image_size=img_size,
-        batch_size=batch_size,
-    )
-
-    preds: List[np.ndarray] = []
-    gts: List[np.ndarray] = []
-
-    inner = tqdm(loader, desc=short_name, leave=False)
-    with torch.no_grad():
-        for batch in inner:
-            if model_type == "deeplabv3plus":
-                pv = batch["image"].to(DEVICE, non_blocking=True)  # [B,3,H,W]
-                gt = batch["mask"].cpu().numpy()                   # [B,H,W] int
-                out = model(pv)                                    # repo returns logits tensor
-                # Unify & upsample to gt size
-                logits = out if isinstance(out, torch.Tensor) else out.logits
-                logits = torch.nn.functional.interpolate(
-                    logits, size=gt.shape[-2:], mode="bilinear", align_corners=False
-                )
-                pred = logits.argmax(1).cpu().numpy()
-
-            else:
+        preds, gts = [], []
+        inner = tqdm(loader, desc=short_name, leave=False, position=1)
+        with torch.no_grad():
+            for batch in inner:
                 pv = batch["pixel_values"].to(DEVICE, non_blocking=True)
                 gt = batch["pixel_mask"].cpu().numpy()
 
                 if model_type == "oneformer":
                     ti = batch["task_inputs"].to(DEVICE, non_blocking=True)
-                    outputs = model(pixel_values=pv, task_inputs=ti)
+                    out = model(pixel_values=pv, task_inputs=ti)
                 else:
-                    outputs = model(pixel_values=pv)
+                    out = model(pixel_values=pv)
 
-                # Unified conversion
-                _, pred_t = process_outputs_for_semantic(
-                    outputs=outputs,
-                    target_size=gt.shape[-2:],   # (H,W)
-                    model_type=model_type
-                )
-                pred = pred_t.cpu().numpy()
+                # SegFormer / BEiT / DeepLab
+                if hasattr(out, "logits"):
+                    logits = torch.nn.functional.interpolate(
+                        out.logits,
+                        size=gt.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    pred = logits.argmax(1).cpu().numpy()
+                # Query-based decoders
+                else:
+                    cls = torch.softmax(out.class_queries_logits, dim=-1)
+                    msk = torch.sigmoid(
+                        torch.nn.functional.interpolate(
+                            out.masks_queries_logits,
+                            size=gt.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                    )
+                    sem = torch.einsum("bqc,bqhw->bchw", cls, msk)
+                    pred = sem.argmax(1).cpu().numpy()
 
-            preds.extend(list(pred))
-            gts.extend(list(gt))
+                preds.extend(pred)
+                gts.extend(gt)
 
-    # Metrics
-    miou, pacc, fwiou, iou_vec, f1_vec, hist = compute_metrics(
-        preds, gts, K=NUM_CLASSES, foreground_K=FOREGROUND_K
-    )
+        miou, pacc, fwiou, iou_vec, f1_vec,hist = compute_metrics(
+            preds, gts, 
+            UniversalSegmentationDataset_Plan5.NUM_CLASSES,
+            UniversalSegmentationDataset_Plan5.FOREGROUND_CLASSES
+        )
 
-    # Confusion matrix PDF per model
-    return {
-        "short_name": short_name,
-        "model_type": model_type,
-        "img_h": img_size[0],
-        "img_w": img_size[1],
-        "mIoU": round(miou, 4),
-        "pixAcc": round(pacc, 4),
-        "FWIoU": round(fwiou, 4),
-        "hist": hist,
-        "iou_vec": iou_vec,
-        "f1_vec": f1_vec,
-        "params": sum(p.numel() for p in model.parameters()) / 1e6,
-        "flops": None if (lambda ex: False)(0) else _try_flops(model, img_size),
-    }
+        cn = UniversalSegmentationDataset_Plan5.CLASS_NAMES
 
+        confmat_pdf = (args.confmat_dir if "args" in globals() else Path("evaluation_updated/confmats")) / f"confmat_{short_name}.pdf"
+        plot_and_save_confmat(
+            hist=hist,
+            class_names=cn,
+            out_pdf=confmat_pdf,
+            normalize=True,
+            exclude_last=True,   # drop "void" in the visual
+            fontsize=15,
+        )
 
-def _try_flops(model: torch.nn.Module, img_size: Tuple[int, int]):
-    try:
-        dummy = torch.randn(1, 3, img_size[0], img_size[1], device=DEVICE)
-        flops, _ = model_stats(model, dummy)
-        return None if flops is None else flops / 1e9
-    except Exception:
-        return None
+        
+        class_iou = dict(zip([f"IoU_{n}" for n in cn], np.round(iou_vec, 3)))
+        class_f1  = dict(zip([f"F1_{n}"  for n in cn], np.round(f1_vec, 3)))
+
+        dummy = torch.randn(1, 3, *img_size).to(DEVICE)
+        flops, params = model_stats(model, dummy)
+
+        rows.append({
+            "model": short_name,
+            "mIoU": round(float(miou), 3),
+            "pixAcc": round(float(pacc), 3),
+            "FWIoU": round(float(fwiou), 3),
+            "FLOPs(G)": None if flops is None else round(flops / 1e9, 2),
+            "Params(M)": round(params / 1e6, 2),
+            **class_iou,
+            **class_f1,
+        })
+        print(rows)
+
+    return pd.DataFrame(rows).set_index("model")
 
 
 # --------------------------------------------------------------------------------------
@@ -323,76 +470,29 @@ def _try_flops(model: torch.nn.Module, img_size: Tuple[int, int]):
 # --------------------------------------------------------------------------------------
 def parse_args():
     ap = argparse.ArgumentParser("Evaluate segmentation models on EIDSeg")
-
-    # Data
-    ap.add_argument("--images", type=Path,
-                    default=Path("../data/EIDSeg_Final_updated/test/images/default"),
-                    help="Path to the *default* image folder (…/images/default)")
-    ap.add_argument("--annotation", type=Path,
-                    default=Path("../data/EIDSeg_Final_updated/test/test.xml"),
-                    help="CVAT XML annotation file")
-
-    # Output
-    ap.add_argument("--csv_out", type=Path,
-                    default=Path("evaluation_updated/test/results.csv"),
-                    help="Where to save the summary CSV")
-    ap.add_argument("--confmat_dir", type=Path,
-                    default=Path("evaluation_updated/confmats"),
-                    help="Directory to save confusion matrices")
-
-    # Evaluate
+    ap.add_argument(
+        "--images", type=Path,
+        default="data/EIDSeg_Final_updated/test/images",
+        help="Folder with evaluation images",
+    )
+    ap.add_argument(
+        "--annotation", type=Path,
+        default="data/EIDSeg_Final_updated/test/test.xml",
+        help="CVAT XML annotation file",
+    )
+    ap.add_argument(
+        "--csv_out", type=Path,
+        default="evaluation_updated/test/beitb.csv",
+        help="Where to save CSV results",
+    )
     ap.add_argument("--batch_size", type=int, default=1)
-
-    # Models to evaluate (hub_or_tag -> short name)
-    ap.add_argument(
-        "--models",
-        nargs="+",
-        default=[
-            # Examples (uncomment to add HF baselines)
-            "nvidia/segformer-b5-finetuned-cityscapes-1024-1024:segformer-b5",
-            
-            #"microsoft/beit-base-finetuned-ade-640-640: beit-base",
-            #"microsoft/beit-large-finetuned-ade-640-640: beit-large",
-
-            #"shi-labs/oneformer_cityscapes_swin_large: oneformer-large",
-
-            #"tue-mps/cityscapes_semantic_eomt_large_1024: eomt-large",
-            
-            # "facebook/mask2former-swin-small-cityscapes-semantic: mask2former-swin-small",
-            # "facebook/mask2former-swin-large-cityscapes-semantic: mask2former-swin-large",
-
-            # Your local DeepLabV3+ tag for the external repo path:
-            #"deeplabv3plus:deeplabv3plus",
-        ],
-        help=(
-            "List of models as 'hub_or_tag:short_name'. "
-            "Use 'deeplabv3plus:...' to load the external repo model."
-        ),
-    )
-    
-
-    # Fine-tuned checkpoints (short_name->path)
-    ap.add_argument(
-        "--ckpt",
-        nargs="*",
-        default=[
-            # Example:
-            "segformer-b5:../runs/segformer/Plan5includebackground_Final_512_512_b5_from_50/weights/best_model.pth",
-            # "mask2former-s:/path/to/your_mask2former_best_model.pth",
-            # Default for your DeepLabV3+ (you can override):
-            #"deeplabv3plus:../DeepLabV3Plus-Pytorch/runs/deeplabv3plus/Plan5includebackground_Final_512_512/weights/best_model.pth",
-        ],
-        help="Optional list of 'short_name:/path/to/ckpt.pth'",
-    )
-
-    # DeepLabV3+ knobs
-    ap.add_argument("--deeplab_backbone", type=str, default="resnet101",
-                    choices=["resnet50", "resnet101", "xception", "mobilenet", "r50", "r101", "xcep", "mbv2"],
-                    help="Backbone used in the external DeepLabV3+ repo")
-    ap.add_argument("--deeplab_os", type=int, default=16, choices=[8, 16],
-                    help="DeepLabV3+ output stride")
-
     return ap.parse_args()
+
+    # ap.add_argument(
+    # "--confmat_dir", type=Path,
+    # default=Path("evaluation_updated/confmats"),
+    # help="Directory to save confusion-matrix PDFs/CSVs per model",)
+
 
 
 # --------------------------------------------------------------------------------------
@@ -401,81 +501,43 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Parse MODEL_CATALOG
-    model_catalog: Dict[str, str] = {}
-    for spec in args.models:
-        if ":" not in spec:
-            raise ValueError(f"Model spec must be 'hub_or_tag:short_name', got: {spec}")
-        hub, short = spec.split(":", 1)
-        model_catalog[hub] = short
 
-    # Parse checkpoints map
-    finetuned_ckpts: Dict[str, Path] = {}
-    for spec in (args.ckpt or []):
-        if ":" not in spec:
-            continue
-        short, path = spec.split(":", 1)
-        p = Path(path)
-        if p.exists():
-            finetuned_ckpts[short] = p
-        else:
-            print(f"⚠️  Checkpoint not found for {short}: {p} (skipping)")
+    MODEL_CATALOG:Dict[str, str] = {
+       #"nvidia/segformer-b5-finetuned-cityscapes-1024-1024": "segformer-b5",
+       "microsoft/beit-base-finetuned-ade-640-640": "beit-base",
+        #"microsoft/beit-large-finetuned-ade-640-640": "beit-large",
+       # "facebook/deeplabv3-resnet101": "deeplabv3+",
+        #"shi-labs/oneformer_cityscapes_swin_large": "oneformer-large",
+        #"tue-mps/cityscapes_semantic_eomt_large_1024": "eomt-large",
+        # "facebook/mask2former-swin-small-cityscapes-semantic": "mask2former-swin-small",
+       # "facebook/mask2former-swin-large-cityscapes-semantic": "mask2former-swin-large",
+    }
 
-    rows: List[Dict[str, float | str]] = []
+    # Optional: fine‑tuned checkpoint paths (short name -> .pth)
+    FINETUNED_CKPTS: Dict[str, str] = {
+        
+       #"segformer-b5": "runs/segformer/Plan5includebackground_Final_512_512_b5_from_50/weights/best_model.pth",
+        "beit-base":         "runs/beit/Plan5includebackground_Final_640_640_b5_base/weights/best_model.pth",
+        #"beit-large":        "runs/beit/Plan5includebackground_Final_640_640_large_from_epoch17/weights/best_model.pth",
+        #"oneformer-large":   "runs/oneformer/Plan5includebackground_Final_512_512_Large_From_Epoch10_2025-07-02_01-36-44/weights/best_model.pth",
+       # "eomt-large":        "runs/eomt/Plan5includebackground_Final_1024_1024_emot_large_from_epoch19/weights/best_model.pth",
+        #"mask2former-swin-small": "runs/Plan5includebackground_Final_512_512_Small_From_epoch58_2025-07-01_23-19-39/weights/best_model.pth",
+        #"mask2former-swin-large": "runs/Plan5includebackground_Final_512_512_Large_From_epoch10_2025-07-01_21-41-16/weights/best_model.pth",
 
-    for hub_or_tag, short in tqdm(model_catalog.items(), desc="Evaluating", unit="model"):
-        ckpt_path = finetuned_ckpts.get(short)
+    }
 
-        result = evaluate_one_model(
-            hub_or_tag=hub_or_tag,
-            short_name=short,
-            images_dir=args.images,
-            annotation_xml=args.annotation,
-            finetuned_path=ckpt_path,
-            batch_size=args.batch_size,
-            deeplab_backbone=args.deeplab_backbone,
-            deeplab_os=args.deeplab_os,
-        )
+    df = evaluate_models(
+        image_dir=args.images,
+        annotation_xml=args.annotation,
+        model_catalog=MODEL_CATALOG,
+        finetuned_ckpts=FINETUNED_CKPTS,
+        batch_size=args.batch_size,
+    )
 
-        # Save confusion matrix
-        hist = result.pop("hist")
-        iou_vec = result.pop("iou_vec")
-        f1_vec = result.pop("f1_vec")
+    print("\nFinal results:\n", df, sep="")
 
-        plot_and_save_confmat(
-            hist=hist,
-            class_names=CLASS_NAMES,
-            out_pdf=args.confmat_dir / f"confmat_{short}.pdf",
-            normalize=True,
-            exclude_last=True,
-            fontsize=14,
-        )
-
-        # Flatten per-class IoU/F1
-        for cname, val in zip(CLASS_NAMES, iou_vec):
-            result[f"IoU_{cname}"] = round(float(val), 4)
-        for cname, val in zip(CLASS_NAMES, f1_vec):
-            result[f"F1_{cname}"] = round(float(val), 4)
-
-        # Params / FLOPs pretty
-        params_m = result.pop("params", None)
-        flops_g  = result.pop("flops", None)
-        if params_m is not None:
-            result["Params(M)"] = round(float(params_m), 2)
-        if flops_g is not None:
-            result["FLOPs(G)"] = round(float(flops_g), 2)
-
-        rows.append({
-            "model": short,
-            **{k: v for k, v in result.items() if not isinstance(v, (np.ndarray,))}
-        })
-
-    # Make CSV
-    import pandas as pd  # lazy import
-    df = pd.DataFrame(rows).set_index("model").sort_index()
     args.csv_out.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(args.csv_out)
-    print("\nFinal results:\n", df)
     print(f"\n✓ Results saved to {args.csv_out}")
 
 
