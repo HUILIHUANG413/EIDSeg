@@ -2,7 +2,7 @@
 
 # EIDSeg: A Pixel-Level Semantic Segmentation Dataset for Post-Earthquake Damage Assessment from Social Media Images
 
-### [Paper(Camera-Ready)]() | [Extended Version]() | Dataset(under review)
+### Paper(Camera-Ready) | [Extended Version](https://arxiv.org/abs/2511.06456) | Dataset(under review)
 
 ## Overview of EIDSeg
 The code in this repository implements the data preparation, model training, and evaluation protocols as described in paper *EIDSeg: A Pixel-Level Semantic Segmentation Dataset for Post-Earthquake Damage Assessment from Social Media Images* in AAAI-AISI 2026. In this repo, we unified training pipeline for the **EIDSeg** dataset (post-earthquake infrastructure damage segmentation) supporting:
