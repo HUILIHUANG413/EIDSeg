@@ -472,12 +472,12 @@ def parse_args():
     ap = argparse.ArgumentParser("Evaluate segmentation models on EIDSeg")
     ap.add_argument(
         "--images", type=Path,
-        default="data/EIDSeg_Final_updated/test/images",
+        default="data/test/images",
         help="Folder with evaluation images",
     )
     ap.add_argument(
         "--annotation", type=Path,
-        default="data/EIDSeg_Final_updated/test/test.xml",
+        default="data/test/test.xml",
         help="CVAT XML annotation file",
     )
     ap.add_argument(

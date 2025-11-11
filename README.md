@@ -73,20 +73,19 @@ The code expects **CVAT-style XML** annotations and images arranged like:
 
 ```
 data/
-└─ EIDSeg_Final_updated/
-   ├─ train/
-   │  ├─ train.xml
-   │  └─ images/
-   │     └─ default/
-   │        ├─ 0001.jpg
-   │        ├─ 0002.png
-   │        └─ ...
-   └─ val/
-      ├─ val.xml
-      └─ images/
-         └─ default/
-            ├─ 1001.jpg
-            └─ ...
+└── train/
+  │  ├─ train.xml
+  │  └─ images/
+  │     └─ default/
+  │        ├─ 0001.jpg
+  │        ├─ 0002.png
+  │        └─ ...
+  └─ val/
+    ├─ val.xml
+    └─ images/
+        └─ default/
+          ├─ 1001.jpg
+          └─ ...
 ```
 
 **Annotations** (CVAT XML):
@@ -119,11 +118,11 @@ data/
 ### A) Train a Hugging Face model (e.g., EoMT)
 
 ```bash
-python -m src.train_EIDSeg \
-  --train-xml   data/EIDSeg_Final_updated/train/train.xml \
-  --train-imgdir data/EIDSeg_Final_updated/train/images \
-  --val-xml     data/EIDSeg_Final_updated/val/val.xml \
-  --val-imgdir   data/EIDSeg_Final_updated/val/images \
+python train_EIDSeg.py \
+  --train-xml   ../data/train/train.xml \
+  --train-imgdir ../data/train/images \
+  --val-xml     ../data/val/val.xml \
+  --val-imgdir   ../data/val/images \
   --model-name   tue-mps/cityscapes_semantic_eomt_large_1024 \
   --image-size   1024 1024 \
   --epochs 50 --batch-size 1 --lr 1e-5 \
@@ -149,11 +148,11 @@ Supported HF models in paper:
    `best_deeplabv3plus_resnet101_cityscapes_os16.pth.tar`) and note the path.
 
 ```bash
-python -m src.train_EIDSeg \
-  --train-xml   data/EIDSeg_Final_updated/train/train.xml \
-  --train-imgdir data/EIDSeg_Final_updated/train/images \
-  --val-xml     data/EIDSeg_Final_updated/val/val.xml \
-  --val-imgdir   data/EIDSeg_Final_updated/val/images \
+python train_EIDSeg.py \
+  --train-xml   ../data/train/train.xml \
+  --train-imgdir ./data/train/images \
+  --val-xml     ../data/val/val.xml \
+  --val-imgdir   ../data/val/images \
   --model-name   deeplabv3plus-resnet101 \
   --deeplab-backbone resnet101 \
   --deeplab-os 16 \
